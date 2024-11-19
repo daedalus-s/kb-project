@@ -1,42 +1,92 @@
 import json
-from abc import abstractmethod, ABC
-from typing import List
-from urllib.parse import urlparse
 import boto3
 import logging
+from urllib.parse import urlparse
 
 logger = logging.getLogger()
 logger.setLevel(logging.DEBUG)
 
-class Chunker(ABC):
-    @abstractmethod
-    def chunk(self, text: str) -> List[str]:
-        raise NotImplementedError()
-        
-class SimpleChunker(Chunker):
-    def chunk(self, text: str) -> List[str]:
-        words = text.split()
-        return [' '.join(words[i:i+100]) for i in range(0, len(words), 100)]
-
-def get_source_role(s3_client, uri):
+def get_original_key_from_location(file_location: dict) -> str:
+    """Extract original file name from the originalFileLocation"""
     try:
-        # Remove s3:// prefix and split into bucket/key
-        uri = uri.replace('s3://', '')
-        bucket, key = uri.split('/', 1)
-        
-        # Get object metadata
-        response = s3_client.head_object(Bucket=bucket, Key=key)
-        logger.debug(f"Source object metadata: {json.dumps(response.get('Metadata', {}))}")
-        return response.get('Metadata', {}).get('role', '')
+        if file_location.get('type') == 'S3':
+            s3_uri = file_location.get('s3_location', {}).get('uri', '')
+            if s3_uri:
+                parsed = urlparse(s3_uri)
+                key = parsed.path.lstrip('/')
+                logger.debug(f"Extracted original key: {key} from URI: {s3_uri}")
+                return key
     except Exception as e:
-        logger.error(f"Error fetching source role from {uri}: {str(e)}")
+        logger.error(f"Error extracting original key from location: {str(e)}")
+    return ''
+
+def get_source_metadata(s3_client, object_key: str) -> str:
+    """Get role metadata from original source object"""
+    try:
+        logger.debug(f"Attempting to get metadata for object: {object_key}")
+        
+        response = s3_client.head_object(
+            Bucket="company-data-rag",
+            Key=object_key
+        )
+        
+        logger.debug(f"Full S3 response metadata: {json.dumps(response.get('Metadata', {}))}")
+        
+        role = response.get('Metadata', {}).get('role')
+        if role is None:
+            logger.warning(f"No 'role' found in metadata for {object_key}")
+            return ''
+        elif role == '':
+            logger.warning(f"Empty role value found in metadata for {object_key}")
+            return ''
+        
+        logger.info(f"Successfully retrieved role '{role}' for {object_key}")
+        return role
+        
+    except Exception as e:
+        logger.error(f"Error getting metadata for {object_key}: {str(e)}")
         return ''
 
+def process_content(file_content: dict, role: str) -> dict:
+    """Add role to metadata JSON string in each content item"""
+    processed_content = {
+        'fileContents': []
+    }
+    
+    for content in file_content.get('fileContents', []):
+        content_metadata = content.get('contentMetadata', {})
+        
+        try:
+            logger.debug(f"Original metadata: {content_metadata}")
+            
+            metadata_str = content_metadata.get('metadata', '{}')
+            metadata_dict = json.loads(metadata_str)
+            
+            if role:
+                metadata_dict['role'] = role
+                logger.debug(f"Added role '{role}' to metadata")
+            else:
+                logger.warning("Skipping empty role value")
+            
+            content_metadata['metadata'] = json.dumps(metadata_dict)
+            logger.debug(f"Updated metadata JSON: {content_metadata['metadata']}")
+            
+        except json.JSONDecodeError as e:
+            logger.error(f"Error parsing metadata JSON: {str(e)}")
+            content_metadata['metadata'] = json.dumps({'role': role}) if role else '{}'
+        
+        processed_content['fileContents'].append({
+            'contentType': content.get('contentType', ''),
+            'contentMetadata': content_metadata,
+            'contentBody': content.get('contentBody', '')
+        })
+    
+    return processed_content
+
 def lambda_handler(event, context):
-    logger.debug('input={}'.format(json.dumps(event)))
+    logger.debug(f'Input event: {json.dumps(event)}')
     s3 = boto3.client('s3')
 
-    # Extract relevant information from the input event
     input_files = event.get('inputFiles')
     input_bucket = event.get('bucketName')
 
@@ -44,88 +94,63 @@ def lambda_handler(event, context):
         raise ValueError("Missing required input parameters")
     
     output_files = []
-    chunker = SimpleChunker()
 
     for input_file in input_files:
         content_batches = input_file.get('contentBatches', [])
-        file_metadata = input_file.get('fileMetadata', {})
         original_file_location = input_file.get('originalFileLocation', {})
+
+        # Get original key from originalFileLocation
+        original_key = get_original_key_from_location(original_file_location)
+        if not original_key:
+            logger.error("Could not determine original file key")
+            continue
+            
+        logger.debug(f"Original file key: {original_key}")
 
         processed_batches = []
         
         for batch in content_batches:
             input_key = batch.get('key')
-
             if not input_key:
-                raise ValueError("Missing uri in content batch")
+                logger.error("Missing key in content batch")
+                continue
             
-            # Read file from S3
+            # Get role from source object
+            role = get_source_metadata(s3, original_key)
+            if not role:
+                logger.warning(f"No role metadata found for {original_key}")
+            
+            # Read and process intermediate file
             file_content = read_s3_file(s3, input_bucket, input_key)
-            
-            # Process content (chunking) with source metadata
-            chunked_content = process_content(file_content, chunker, s3)
+            processed_content = process_content(file_content, role)
             
             output_key = f"Output/{input_key}"
+            write_to_s3(s3, input_bucket, output_key, processed_content)
             
-            # Write processed content back to S3
-            write_to_s3(s3, input_bucket, output_key, chunked_content)
-            
-            # Add processed batch information
             processed_batches.append({
                 'key': output_key
             })
         
-        # Prepare output file information
         output_file = {
             'originalFileLocation': original_file_location,
-            'fileMetadata': file_metadata,
+            'fileMetadata': input_file.get('fileMetadata', {}),
             'contentBatches': processed_batches
         }
         output_files.append(output_file)
     
     result = {'outputFiles': output_files}
+    logger.debug(f"Output result: {json.dumps(result)}")
     return result
 
 def read_s3_file(s3_client, bucket, key):
+    """Read JSON content from S3"""
     response = s3_client.get_object(Bucket=bucket, Key=key)
     return json.loads(response['Body'].read().decode('utf-8'))
 
 def write_to_s3(s3_client, bucket, key, content):
+    """Write content to S3"""
     s3_client.put_object(
         Bucket=bucket,
         Key=key,
         Body=json.dumps(content)
     )
-
-def process_content(file_content: dict, chunker: Chunker, s3_client) -> dict:
-    chunked_content = {
-        'fileContents': []
-    }
-    
-    for content in file_content.get('fileContents', []):
-        content_body = content.get('contentBody', '')
-        content_type = content.get('contentType', '')
-        content_metadata = content.get('contentMetadata', {})
-        
-        # Debug logging for content metadata
-        logger.debug(f"Processing content with metadata: {json.dumps(content_metadata)}")
-        
-        # Get source URI and role
-        source_uri = content_metadata.get('x-amz-bedrock-kb-source-uri', '')
-        if source_uri:
-            role = get_source_role(s3_client, source_uri)
-            if role:
-                content_metadata['role'] = role
-                logger.debug(f"Added role '{role}' from source URI {source_uri}")
-        
-        words = content['contentBody']
-        chunks = chunker.chunk(words)
-        
-        for chunk in chunks:
-            chunked_content['fileContents'].append({
-                'contentType': content_type,
-                'contentMetadata': content_metadata, 
-                'contentBody': chunk
-            })
-    
-    return chunked_content
